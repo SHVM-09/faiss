@@ -1,0 +1,8 @@
+Machine learning is a subset of artificial intelligence that focuses on building systems that can learn from data. These systems improve their performance over time without being explicitly programmed for every task.
+
+Supervised learning is one of the main paradigms in machine learning, where algorithms learn from labeled training data. Common supervised learning tasks include classification and regression.
+
+Deep learning uses neural networks with multiple layers to model and understand complex patterns.
+
+
+Nirma University!
