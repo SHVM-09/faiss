@@ -8,41 +8,45 @@ This document explains the models currently used, their characteristics, and bet
 
 ### 1. Text Embedding Model
 
-**Current:** `sentence-transformers/all-MiniLM-L6-v2`
+**Current:** `BAAI/bge-large-en-v1.5`
 
 **Characteristics:**
-- **Dimensions:** 384
-- **Size:** ~80MB
-- **Speed:** Very fast (optimized for speed)
-- **Accuracy:** Good for general semantic search
-- **Best for:** General-purpose semantic search, fast retrieval
-- **Trade-off:** Prioritizes speed over maximum accuracy
+- **Dimensions:** 1024
+- **Size:** ~1.3GB
+- **Speed:** Moderate (optimized for accuracy)
+- **Accuracy:** State-of-the-art for English text
+- **Best for:** High-accuracy semantic search, production use
+- **Trade-off:** Larger model size and slower than smaller models, but best accuracy
 
 **Why it's used:**
-- Fast inference (important for real-time search)
-- Small model size (easy to deploy)
-- Good balance between speed and accuracy
-- Works well for most use cases
+- Best accuracy on benchmarks for English text
+- Excellent for semantic search quality
+- Used for both regular text files and PDF text extraction
+- Well-maintained and actively developed
+
+**Previous Model:** `sentence-transformers/all-MiniLM-L6-v2` (384 dim, ~80MB) - Faster but less accurate
 
 ---
 
 ### 2. Image Embedding Model
 
-**Current:** `openai/clip-vit-base-patch32`
+**Current:** `laion/CLIP-ViT-H-14-laion2B-s32B-b79K`
 
 **Characteristics:**
-- **Dimensions:** 512
-- **Size:** ~500MB
-- **Speed:** Fast
-- **Accuracy:** Good for general image-text search
-- **Best for:** Text-to-image search, image classification
-- **Trade-off:** Released in 2021, newer models available
+- **Dimensions:** 1024
+- **Size:** ~2.5GB
+- **Speed:** Moderate (high-accuracy model)
+- **Accuracy:** Excellent for multimodal search
+- **Best for:** High-quality image-text search, PDF page images
+- **Trade-off:** Larger model size, but best accuracy for CLIP models
 
 **Why it's used:**
-- Industry standard for image-text search
-- Well-tested and reliable
-- Good balance of performance and speed
-- Easy to use with HuggingFace
+- State-of-the-art CLIP model for multimodal search
+- Excellent accuracy for image-text understanding
+- Used for both standalone images and PDF page images
+- Trained on large-scale LAION dataset
+
+**Previous Model:** `openai/clip-vit-base-patch32` (512 dim, ~500MB) - Faster but less accurate
 
 ---
 

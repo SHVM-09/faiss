@@ -143,9 +143,14 @@ def root():
             "images": [".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tiff", ".tif"],
             "pdfs": [".pdf"]
         },
+        "pdf_modes": {
+            "plain": "Extract text only → chunk → embed (text embeddings)",
+            "with_photo": "Convert pages to images → embed (image embeddings)"
+        },
         "features": {
-            "text_search": "Semantic search for text content from .txt and .md files",
-            "image_search": "Search image files using text queries (CLIP model)",
+            "text_search": "Semantic search for text content from .txt, .md files, and PDF text",
+            "image_search": "Search image files and PDF pages using text queries (CLIP model)",
+            "pdf_support": "Flexible PDF processing: text extraction (plain) or image conversion (with_photo)",
             "multi_modal": "Single query searches both text and images simultaneously",
             "deduplication": "Automatically removes duplicate results"
         },
