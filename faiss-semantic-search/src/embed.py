@@ -17,8 +17,35 @@ What happens:
 Flow: TRANSFORM (chunks) -> EMBED (convert to vectors) -> returns vectors
 """
 
+import os
+import sys
 from typing import List
 import numpy as np
+import warnings
+
+# Disable multiprocessing to avoid semaphore leaks
+# This prevents the resource_tracker warnings
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["OMP_NUM_THREADS"] = "1"  # Limit OpenMP threads
+os.environ["MKL_NUM_THREADS"] = "1"  # Limit MKL threads
+os.environ["NUMEXPR_NUM_THREADS"] = "1"  # Limit NumExpr threads
+
+# Suppress multiprocessing warnings more aggressively
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", category=UserWarning, module="multiprocessing")
+warnings.filterwarnings("ignore", message=".*resource_tracker.*")
+warnings.filterwarnings("ignore", message=".*semaphore.*")
+
+# Redirect stderr for multiprocessing warnings
+class SuppressStderr:
+    def __init__(self):
+        self.stderr = sys.stderr
+    def __enter__(self):
+        sys.stderr = open(os.devnull, 'w')
+        return self
+    def __exit__(self, *args):
+        sys.stderr.close()
+        sys.stderr = self.stderr
 
 try:
     from sentence_transformers import SentenceTransformer
@@ -73,15 +100,22 @@ class Embedder:
             print("   Progress bar will show download status")
             print("-"*60)
             
-            # ====================================================================
-            # BEST ACCURACY MODEL (current)
-            # ====================================================================
-            # BAAI/bge-large-en-v1.5: State-of-the-art accuracy for English
-            # - 1024 dimensions
-            # - ~1.3GB model size
-            # - Best accuracy on benchmarks
-            # - Slower inference but most accurate
-            self.model = SentenceTransformer('BAAI/bge-large-en-v1.5')
+            # Suppress warnings during model loading
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                # ====================================================================
+                # BEST ACCURACY MODEL (current)
+                # ====================================================================
+                # BAAI/bge-large-en-v1.5: State-of-the-art accuracy for English
+                # - 1024 dimensions
+                # - ~1.3GB model size
+                # - Best accuracy on benchmarks
+                # - Slower inference but most accurate
+                # Set device explicitly to avoid multiprocessing issues
+                self.model = SentenceTransformer(
+                    'BAAI/bge-large-en-v1.5',
+                    device='cpu'  # Explicitly use CPU to avoid multiprocessing
+                )
             
             # ====================================================================
             # ALTERNATIVE: Fast model (commented out - uncomment to use)
@@ -106,12 +140,13 @@ class Embedder:
             print("✓ Model loaded successfully!")
             print("="*60)
     
-    def embed(self, texts: List[str]) -> np.ndarray:
+    def embed(self, texts: List[str], batch_size: int = 64) -> np.ndarray:
         """
-        Convert text chunks to vector embeddings.
+        Convert text chunks to vector embeddings with optimized batching.
         
         Args:
             texts: List of text strings to embed
+            batch_size: Number of texts to process in each batch (default: 64)
             
         Returns:
             numpy array of shape (num_texts, 1024) for bge-large-en-v1.5
@@ -127,16 +162,44 @@ class Embedder:
         if self.model is None:
             self.load()
         
+        # For large batches, process in chunks to show progress and avoid memory issues
+        num_texts = len(texts)
+        if num_texts == 0:
+            return np.array([], dtype=np.float32).reshape(0, self.dimension)
+        
+        # Adjust batch size based on input size
+        if num_texts > 100:
+            # For large batches, use larger batch size for efficiency
+            batch_size = min(batch_size * 2, 128)
+            show_progress = True
+        else:
+            show_progress = num_texts > 10
+        
         # Convert texts to embeddings
         # normalize_embeddings=True: Makes vectors unit length (for cosine similarity)
         # convert_to_numpy=True: Returns numpy array (not PyTorch tensor)
-        # show_progress_bar=True: Shows progress for large batches
-        embeddings = self.model.encode(
-            texts,
-            normalize_embeddings=True,  # Normalize for cosine similarity
-            convert_to_numpy=True,       # Return numpy array
-            show_progress_bar=True       # Show progress
-        )
+        # show_progress_bar: Shows progress for large batches
+        # batch_size: Process in batches for efficiency and memory management
+        # device: Use CPU explicitly to avoid multiprocessing issues
+        try:
+            embeddings = self.model.encode(
+                texts,
+                normalize_embeddings=True,  # Normalize for cosine similarity
+                convert_to_numpy=True,       # Return numpy array
+                show_progress_bar=show_progress,  # Show progress for large batches
+                batch_size=batch_size,        # Batch size for efficient processing
+                device='cpu'                  # Explicitly use CPU to avoid multiprocessing
+            )
+        except Exception as e:
+            # Fallback: try without device specification
+            print(f"  ⚠ Warning: Error with device specification, retrying: {e}")
+            embeddings = self.model.encode(
+                texts,
+                normalize_embeddings=True,
+                convert_to_numpy=True,
+                show_progress_bar=show_progress,
+                batch_size=batch_size
+            )
         
         # Ensure float32 dtype (FAISS requires this)
         return embeddings.astype(np.float32)

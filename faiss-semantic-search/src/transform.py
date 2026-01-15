@@ -28,7 +28,12 @@ Example:
 """
 
 import re
+import sys
 from typing import List, Dict
+
+# Suppress warnings during chunking
+import warnings
+warnings.filterwarnings("ignore")
 
 
 def transform_to_chunks(documents: List[Dict], chunk_size: int = 800, overlap: int = 120) -> List[Dict]:
@@ -72,9 +77,21 @@ def transform_to_chunks(documents: List[Dict], chunk_size: int = 800, overlap: i
         text = doc["content"]      # Get the text content
         filename = doc["filename"]  # Get the filename
         
+        # For very large documents, show progress
+        text_len = len(text)
+        is_large = text_len > 100000  # More than 100K characters
+        
+        if is_large:
+            print(f"    Processing large document ({text_len:,} characters)...")
+        
         # Clean up text: replace multiple spaces/newlines with single space
         # This makes the text more uniform and easier to process
-        text = re.sub(r'\s+', ' ', text.strip())
+        # For large texts, do this more efficiently
+        if is_large:
+            # For large texts, use a more efficient approach
+            text = ' '.join(text.split())
+        else:
+            text = re.sub(r'\s+', ' ', text.strip())
         
         # Skip empty documents
         if not text:
@@ -91,6 +108,11 @@ def transform_to_chunks(documents: List[Dict], chunk_size: int = 800, overlap: i
             # Document is large, split it into multiple chunks
             start = 0      # Start position in text
             chunk_num = 0  # Chunk counter
+            total_chars = len(text)
+            estimated_chunks = (total_chars // (chunk_size - overlap)) + 1
+            
+            if is_large:
+                print(f"    Splitting into ~{estimated_chunks} chunks...")
             
             # Keep creating chunks until we've processed all text
             while start < len(text):
@@ -99,8 +121,10 @@ def transform_to_chunks(documents: List[Dict], chunk_size: int = 800, overlap: i
                 
                 # Try to break at sentence boundary (better than mid-sentence)
                 # Look for period (.) near the end of chunk
+                # For large documents, limit the search range for performance
                 if end < len(text):
-                    sentence_end = text.rfind('.', start, end)
+                    search_start = max(start, end - 200)  # Only search last 200 chars
+                    sentence_end = text.rfind('.', search_start, end)
                     if sentence_end > start:
                         end = sentence_end + 1  # Include the period
                 
@@ -115,6 +139,11 @@ def transform_to_chunks(documents: List[Dict], chunk_size: int = 800, overlap: i
                         "chunk_text": chunk_text
                     })
                     chunk_num += 1
+                    
+                    # Show progress for large documents
+                    if is_large and chunk_num % 50 == 0:
+                        progress = (end / total_chars) * 100
+                        print(f"    Progress: {chunk_num} chunks created ({progress:.1f}%)")
                 
                 # Move start position forward, accounting for overlap
                 # Overlap ensures context isn't lost between chunks
@@ -124,5 +153,8 @@ def transform_to_chunks(documents: List[Dict], chunk_size: int = 800, overlap: i
                 # Safety check: don't go backwards
                 if start <= 0:
                     start = end
+        
+        if is_large:
+            print(f"    ✓ Created {len([c for c in chunks if c['source_file'] == filename])} chunks from {filename}")
     
     return chunks

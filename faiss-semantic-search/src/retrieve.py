@@ -29,8 +29,14 @@ try:
 except ImportError:
     ImageEmbedder = None
 
+# Optional PDF embedder import (for PDF text/image search)
+try:
+    from .pdf_process import PDFMultimodalEmbedder
+except ImportError:
+    PDFMultimodalEmbedder = None
 
-def retrieve_similar(query: str, k: int, embedder: Embedder, image_embedder: Optional[object], store: VectorStore) -> Dict:
+
+def retrieve_similar(query: str, k: int, embedder: Embedder, image_embedder: Optional[object], store: VectorStore, pdf_embedder: Optional[object] = None) -> Dict:
     """
     Search for documents and images similar to the query.
     
@@ -74,33 +80,38 @@ def retrieve_similar(query: str, k: int, embedder: Embedder, image_embedder: Opt
     # ========================================================================
     # STEP 1: Search text index
     # ========================================================================
+    # Note: Text index contains both regular text (.txt, .md) and PDF text chunks.
+    # Both are embedded with the same text embedder (BAAI/bge-large-en-v1.5),
+    # so we can search them all together.
     if store.text_index is not None and store.text_index.ntotal > 0:
-        # Convert query text to vector using the same embedding model
-        # This ensures the query is in the same space as the indexed documents
-        query_vector = embedder.embed([query])[0]  # Get first (and only) vector
-        query_vector = query_vector.reshape(1, -1).astype(np.float32)  # Shape: (1, 1024) for bge-large-en-v1.5
+        # Search with regular text embedder (works for both regular text and PDF text)
+        query_vector = embedder.embed([query])[0]
+        query_vector = query_vector.reshape(1, -1).astype(np.float32)
         
-        # Search FAISS index for k most similar vectors
-        # search() returns:
-        #   - scores: Similarity scores (higher = more similar, range: 0-1)
-        #   - indices: Vector IDs in the index
-        scores, indices = store.text_index.search(query_vector, min(k, store.text_index.ntotal))
+        # Search more results than requested to ensure we get good diversity
+        num_results = min(k * 2, store.text_index.ntotal)
+        scores, indices = store.text_index.search(query_vector, num_results)
         
-        # Format text results
+        # Format text results (includes both regular text and PDF text)
         for idx, score in zip(indices[0], scores[0]):
-            if idx >= 0:  # Valid result (FAISS returns -1 for invalid)
-                # Get metadata for this vector ID
-                metadata = store.text_metadata[idx]
-                
-                # Create result dictionary
-                results["text_results"].append({
-                    "score": float(score),                    # Similarity score (0-1)
-                    "source": metadata["source_file"],        # Original filename
-                    "chunk_id": metadata["chunk_id"],        # Chunk identifier
-                    "chunk_text": metadata["chunk_text"],    # Full chunk text
-                    "preview": metadata["chunk_text"][:200] + "..." if len(metadata["chunk_text"]) > 200 else metadata["chunk_text"],
-                    "type": "text"
-                })
+            if idx >= 0 and idx < len(store.text_metadata):
+                try:
+                    metadata = store.text_metadata[idx]
+                    result = {
+                        "score": float(score),
+                        "source": metadata.get("source_file", "unknown"),
+                        "chunk_id": metadata.get("chunk_id", f"unknown::{idx}"),
+                        "chunk_text": metadata.get("chunk_text", ""),
+                        "preview": (metadata.get("chunk_text", "")[:200] + "...") if len(metadata.get("chunk_text", "")) > 200 else metadata.get("chunk_text", ""),
+                        "type": metadata.get("type", "text")
+                    }
+                    # Add page_num if it's PDF text (though PDF text chunks don't have page_num in current implementation)
+                    if metadata.get("page_num") is not None:
+                        result["page_num"] = metadata.get("page_num")
+                    results["text_results"].append(result)
+                except (KeyError, IndexError, TypeError) as e:
+                    print(f"Warning: Error accessing metadata at index {idx}: {e}")
+                    continue
     
     # ========================================================================
     # STEP 2: Search image index using CLIP
@@ -118,16 +129,24 @@ def retrieve_similar(query: str, k: int, embedder: Embedder, image_embedder: Opt
             
             # Format image results
             for idx, score in zip(indices[0], scores[0]):
-                if idx >= 0:
-                    metadata = store.image_metadata[idx]
-                    results["image_results"].append({
-                        "score": float(score),
-                        "source": metadata["source_file"],
-                        "image_id": metadata["image_id"],
-                        "image_index": metadata["image_index"],
-                        "image_path": metadata.get("image_path"),  # Path to saved image file
-                        "type": "image"
-                    })
+                if idx >= 0 and idx < len(store.image_metadata):
+                    try:
+                        metadata = store.image_metadata[idx]
+                        result = {
+                            "score": float(score),
+                            "source": metadata.get("source_file", "unknown"),
+                            "image_id": metadata.get("image_id", f"unknown::{idx}"),
+                            "image_index": metadata.get("image_index", idx),
+                            "image_path": metadata.get("image_path"),
+                            "type": metadata.get("type", "image")
+                        }
+                        # Add page_num if it's a PDF image
+                        if metadata.get("page_num") is not None:
+                            result["page_num"] = metadata["page_num"]
+                        results["image_results"].append(result)
+                    except (KeyError, IndexError, TypeError) as e:
+                        print(f"Warning: Error accessing image metadata at index {idx}: {e}")
+                        continue
         except Exception as e:
             print(f"Warning: Image search failed: {e}")
     

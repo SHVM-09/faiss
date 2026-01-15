@@ -4,5 +4,6 @@ numpy>=1.24.0
 torch>=2.0.0
 transformers>=4.30.0
 huggingface_hub>=0.16.0
-# pymupdf>=1.23.0  # Not needed - PDF support removed
+pymupdf>=1.23.0  # For PDF processing
+pdf2image>=1.16.0  # For PDF to image conversion (requires poppler)
 Pillow>=10.0.0
