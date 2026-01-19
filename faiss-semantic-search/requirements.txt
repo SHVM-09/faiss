@@ -7,3 +7,9 @@ huggingface_hub>=0.16.0
 pymupdf>=1.23.0  # For PDF processing
 pdf2image>=1.16.0  # For PDF to image conversion (requires poppler)
 Pillow>=10.0.0
+ollama>=0.6.0  # For image descriptions using Ollama vision models
+requests>=2.31.0  # For demo_validation.py
+# Note: FAISS must be installed separately:
+# conda install -c conda-forge faiss-cpu
+# or
+# conda install -c conda-forge faiss-gpu
