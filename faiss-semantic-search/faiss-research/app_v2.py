@@ -331,17 +331,18 @@ def ingest():
         # Store in production VectorStoreV2
         store = get_store()
         
-        # Store text chunks
+        # PHASE 1: Collect ALL vectors first (store in SQLite without training)
+        # Store text chunks (skip training check - will train at end)
         if text_vectors is not None and chunks:
-            store.store_text(text_vectors, chunks, namespace=namespace)
+            store.store_text(text_vectors, chunks, namespace=namespace, skip_training_check=True)
         
-        # Store image embeddings (CLIP)
+        # Store image embeddings (CLIP) (skip training check - will train at end)
         if image_vectors is not None and images:
-            store.store_images(image_vectors, images, namespace=namespace)
+            store.store_images(image_vectors, images, namespace=namespace, skip_training_check=True)
         
-        # Store image description chunks as text embeddings (for text-to-image search)
+        # Store image description chunks as text embeddings (skip training check - will train at end)
         if image_description_vectors is not None and image_description_chunks:
-            store.store_text(image_description_vectors, image_description_chunks, namespace=namespace)
+            store.store_text(image_description_vectors, image_description_chunks, namespace=namespace, skip_training_check=True)
         
         # Process PDFs - ALWAYS do BOTH text and image embeddings
         pdf_stats = {}
@@ -371,8 +372,8 @@ def ingest():
                             if text_chunks_pdf:
                                 chunk_texts = [chunk["chunk_text"] for chunk in text_chunks_pdf]
                                 text_vectors_pdf = embedder.embed(chunk_texts, batch_size=128)
-                                # Store text embeddings
-                                store.store_text(text_vectors_pdf, text_chunks_pdf, namespace=namespace)
+                                # Store text embeddings (skip training check - will train at end)
+                                store.store_text(text_vectors_pdf, text_chunks_pdf, namespace=namespace, skip_training_check=True)
                                 pdf_stats["pdf_text_vectors_stored"] = pdf_stats.get("pdf_text_vectors_stored", 0) + len(text_vectors_pdf)
                                 print(f"  ✓ Stored {len(text_vectors_pdf)} text embeddings from PDF")
                     except Exception as e:
@@ -405,9 +406,9 @@ def ingest():
                                             "image_path": page_data.get("image_path")
                                         })
                                 
-                                # Store image embeddings (CLIP)
+                                # Store image embeddings (CLIP) (skip training check - will train at end)
                                 if image_data_list:
-                                    store.store_images(image_vectors_pdf, image_data_list, namespace=namespace)
+                                    store.store_images(image_vectors_pdf, image_data_list, namespace=namespace, skip_training_check=True)
                                     pdf_stats["pdf_image_vectors_stored"] = pdf_stats.get("pdf_image_vectors_stored", 0) + len(image_vectors_pdf)
                                     print(f"  ✓ Stored {len(image_vectors_pdf)} image embeddings from PDF pages")
                         else:
@@ -423,16 +424,47 @@ def ingest():
                     traceback.print_exc()
                     continue
         
+        # PHASE 2: Finalize ingestion - check 20% rule ONCE and train if needed
+        print("\n" + "="*60)
+        print("Finalizing ingestion: Checking 20% rule and training if needed...")
+        print("="*60)
+        
+        final_training_info = store.finalize_ingestion(namespace=namespace)
+        
+        text_training_info = final_training_info.get("text_training_info")
+        image_training_info = final_training_info.get("image_training_info")
+        
+        if text_training_info and text_training_info.get("was_trained"):
+            print(f"\n✓ Text index trained (reason: {text_training_info.get('retrain_reason')})")
+            print(f"  Existing: {text_training_info.get('existing_ntotal')}, New: {text_training_info.get('new_count')}, Final: {text_training_info.get('final_ntotal')}")
+        
+        if image_training_info and image_training_info.get("was_trained"):
+            print(f"\n✓ Image index trained (reason: {image_training_info.get('retrain_reason')})")
+            print(f"  Existing: {image_training_info.get('existing_ntotal')}, New: {image_training_info.get('new_count')}, Final: {image_training_info.get('final_ntotal')}")
+        
         # Save to disk
         store.save()
         
         # Reset global store
         store = None
         
-        # Return statistics
-        return jsonify({
+        # Determine overall training status
+        primary_training_info = text_training_info or image_training_info
+        
+        # Return statistics with training info
+        response = {
             "success": True,
             "message": "Documents ingested successfully",
+            "index_type": "IVF_PQ",
+            "was_trained": primary_training_info.get("was_trained", False) if primary_training_info else False,
+            "retrain_reason": primary_training_info.get("retrain_reason") if primary_training_info else None,
+            "existing_ntotal": primary_training_info.get("existing_ntotal", 0) if primary_training_info else 0,
+            "new_count": primary_training_info.get("new_count", 0) if primary_training_info else 0,
+            "final_ntotal": primary_training_info.get("final_ntotal", 0) if primary_training_info else 0,
+            "nlist": primary_training_info.get("nlist") if primary_training_info else None,
+            "m": primary_training_info.get("m") if primary_training_info else None,
+            "nbits": primary_training_info.get("nbits") if primary_training_info else None,
+            "nprobe": primary_training_info.get("nprobe") if primary_training_info else None,
             "stats": {
                 "files_loaded": len(documents) + len(images),
                 "text_files_loaded": len(documents),
@@ -447,7 +479,15 @@ def ingest():
                 "namespace": namespace,
                 **pdf_stats
             }
-        }), 200
+        }
+        
+        # Add detailed training info per vector type if available
+        if text_training_info:
+            response["text_training_info"] = text_training_info
+        if image_training_info:
+            response["image_training_info"] = image_training_info
+        
+        return jsonify(response), 200
     
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
@@ -486,32 +526,39 @@ def search():
         store = get_store()
         embedder = get_embedder()
         
+        # Get namespace (default if not provided)
+        namespace = namespace or store.default_namespace
+        
         results = {
             "query": query_text,
             "k": k,
+            "namespace": namespace,
             "text_results": [],
             "image_results": []
         }
         
         # Search text
         if vector_type in ["text", "both"]:
-            if store.text_index is not None and store.text_index.ntotal > 0:
+            try:
                 query_vector = embedder.embed([query_text])[0]
                 query_vector = query_vector.reshape(1, -1).astype(np.float32)
                 text_results = store.search_text(query_vector, k, namespace=namespace)
                 results["text_results"] = text_results
+            except Exception as e:
+                print(f"Text search failed: {e}")
+                results["text_results"] = []
         
         # Search images
         if vector_type in ["image", "both"]:
-            if store.image_index is not None and store.image_index.ntotal > 0:
-                try:
-                    image_embedder = get_image_embedder()
-                    query_vector = image_embedder.embed_text(query_text)
-                    query_vector = query_vector.reshape(1, -1).astype(np.float32)
-                    image_results = store.search_images(query_vector, k, namespace=namespace)
-                    results["image_results"] = image_results
-                except Exception as e:
-                    print(f"Image search failed: {e}")
+            try:
+                image_embedder = get_image_embedder()
+                query_vector = image_embedder.embed_text(query_text)
+                query_vector = query_vector.reshape(1, -1).astype(np.float32)
+                image_results = store.search_images(query_vector, k, namespace=namespace)
+                results["image_results"] = image_results
+            except Exception as e:
+                print(f"Image search failed: {e}")
+                results["image_results"] = []
         
         return jsonify(results), 200
     
