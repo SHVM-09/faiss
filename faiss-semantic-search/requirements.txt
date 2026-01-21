@@ -1,4 +1,5 @@
 flask==3.0.0
+flask-cors>=4.0.0
 sentence-transformers>=2.2.0
 numpy>=1.24.0
 torch>=2.0.0
@@ -8,7 +9,8 @@ pymupdf>=1.23.0  # For PDF processing
 pdf2image>=1.16.0  # For PDF to image conversion (requires poppler)
 Pillow>=10.0.0
 ollama>=0.6.0  # For image descriptions using Ollama vision models
-requests>=2.31.0  # For demo_validation.py
+requests>=2.31.0  # For demo_validation.py and router
+xxhash>=3.4.0  # For stable hashing in router (fast alternative to SHA1)
 # Note: FAISS must be installed separately:
 # conda install -c conda-forge faiss-cpu
 # or

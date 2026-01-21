@@ -514,12 +514,6 @@ class VectorStoreV2:
             index = self._create_flat_index(dimension)
             index_type = "IndexFlatIP"
             nlist = None  # Not applicable for Flat index
-        elif len(vectors) < recommended_training_points:
-            # Use IVF-PQ even if below recommended training size
-            # Warnings may appear but are harmless - index will still work correctly
-            print(f"  Using IVF-PQ with {len(vectors)} vectors (nlist={actual_nlist}, recommended training: {recommended_training_points})")
-            print(f"  Note: FAISS may show warnings about training points - these are informational and can be safely ignored")
-            # Continue to IVF-PQ creation below (fall through to else block)
         elif len(vectors) < min_training_points:
             # Use IndexFlatIP if we don't have enough vectors for even minimum training
             print(f"  Insufficient vectors ({len(vectors)} < {min_training_points} required for {actual_nlist} clusters), using IndexFlatIP instead of IndexIVFPQ")
@@ -527,6 +521,17 @@ class VectorStoreV2:
             index_type = "IndexFlatIP"
             nlist = None  # Not applicable for Flat index
         else:
+            # Use IVF-PQ (even if below recommended training size)
+            # Warnings may appear but are harmless - index will still work correctly
+            if len(vectors) < recommended_training_points:
+                print(f"  Using IVF-PQ with {len(vectors)} vectors (nlist={actual_nlist}, recommended training: {recommended_training_points})")
+                print(f"  Note: FAISS may show warnings about training points - these are informational and can be safely ignored")
+            
+            # Initialize index variable to None to ensure it's always defined
+            index = None
+            index_type = None
+            nlist = None
+            
             # Convert vectors list to numpy array for training
             vectors_array = np.array(vectors, dtype=np.float32)
             if len(vectors_array.shape) == 1:
@@ -606,6 +611,10 @@ class VectorStoreV2:
                     index = self._create_flat_index(dimension)
                     index_type = "IndexFlatIP"
                     nlist = None
+        
+        # Ensure index is defined before using it
+        if index is None:
+            raise RuntimeError(f"Index was not created for {vector_type} vectors (count: {len(vectors)})")
         
         # Add all vectors
         vectors_array = np.array(vectors, dtype=np.float32).reshape(-1, dimension)
@@ -1354,9 +1363,7 @@ class VectorStoreV2:
         return results
     
     def save(self):
-        """Save all namespace indices and manifests."""
-        # Indices are saved automatically in store_text/store_images
-        # This method is kept for API compatibility
+        """Save all namespace indices and manifests (indices are saved automatically during operations)."""
         pass
     
     def load(self) -> bool:
@@ -1369,8 +1376,6 @@ class VectorStoreV2:
         # Lazy loading - indices are loaded on demand
         return True
     
-    # Keep all deletion/restore/search methods from original implementation
-    # They need to be updated to work with per-namespace indices
     
     def delete_by_doc_id(self, doc_id: str, namespace: Optional[str] = None, hard_delete: bool = False) -> dict:
         """Delete all vectors for a document (works with per-namespace indices)."""
@@ -1782,6 +1787,55 @@ class VectorStoreV2:
             "namespace_counts": namespace_counts,
             "namespaces": namespaces_info
         }
+    
+    def get_all_vectors(self, namespace: Optional[str] = None, limit: Optional[int] = None, offset: int = 0) -> List[Dict]:
+        """
+        Get all vectors from the database.
+        
+        Args:
+            namespace: Optional namespace filter
+            limit: Optional limit on number of vectors to return
+            offset: Offset for pagination
+        
+        Returns:
+            List of vector dictionaries with metadata
+        """
+        conn = sqlite3.connect(self.metadata_db_path)
+        cursor = conn.cursor()
+        
+        query = "SELECT vector_id, doc_id, chunk_id, namespace, vector_type, metadata_json, created_at FROM vectors WHERE deleted = 0"
+        params = []
+        
+        if namespace:
+            query += " AND namespace = ?"
+            params.append(namespace)
+        
+        query += " ORDER BY vector_id"
+        
+        if limit:
+            query += " LIMIT ? OFFSET ?"
+            params.extend([limit, offset])
+        
+        cursor.execute(query, params)
+        rows = cursor.fetchall()
+        conn.close()
+        
+        vectors = []
+        for row in rows:
+            vector_id, doc_id, chunk_id, ns, vector_type, metadata_json, created_at = row
+            metadata = json.loads(metadata_json) if metadata_json else {}
+            
+            vectors.append({
+                "vector_id": vector_id,
+                "doc_id": doc_id,
+                "chunk_id": chunk_id,
+                "namespace": ns,
+                "vector_type": vector_type,
+                "metadata": metadata,
+                "created_at": created_at
+            })
+        
+        return vectors
     
     def clear(self):
         """Clear all data."""

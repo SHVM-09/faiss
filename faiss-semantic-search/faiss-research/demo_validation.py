@@ -2,13 +2,13 @@
 Demo Script: Validate Production Features
 ==========================================
 Tests the complete workflow:
-1. Insert vectors
+1. Ingest documents
 2. Search
-3. Delete
+3. Delete (soft/hard)
 4. Verify deletion
-5. Compact
-6. Create snapshot
-7. Load snapshot
+5. Restore (soft delete only)
+6. Stats
+7. Reset
 """
 
 import requests
@@ -38,38 +38,42 @@ def print_response(title, response):
         print(response.text)
 
 
-def test_insert():
-    """Test inserting text vectors."""
+def test_ingest():
+    """Test ingesting documents."""
     print("\n" + "="*60)
-    print("TEST 1: Insert Text Vectors")
+    print("TEST 1: Ingest Documents")
     print("="*60)
     
-    # Create sample documents
-    documents = [
-        {"filename": "doc1.txt", "content": "Machine learning is a subset of artificial intelligence."},
-        {"filename": "doc2.txt", "content": "Natural language processing helps computers understand human language."},
-        {"filename": "doc3.txt", "content": "Deep learning uses neural networks with multiple layers."}
-    ]
+    # Create a temporary directory with test files
+    import tempfile
+    import os
+    temp_dir = tempfile.mkdtemp()
     
-    # Transform to chunks
-    chunks = transform_to_chunks(documents, chunk_size=100, overlap=20)
-    print(f"Created {len(chunks)} chunks")
+    # Create test files
+    test_files = {
+        "doc1.txt": "Machine learning is a subset of artificial intelligence.",
+        "doc2.txt": "Natural language processing helps computers understand human language.",
+        "doc3.txt": "Deep learning uses neural networks with multiple layers."
+    }
     
-    # Embed
-    embedder = Embedder()
-    embedder.load()
-    chunk_texts = [chunk["chunk_text"] for chunk in chunks]
-    vectors = embedder.embed(chunk_texts)
+    for filename, content in test_files.items():
+        with open(os.path.join(temp_dir, filename), 'w') as f:
+            f.write(content)
     
-    # Insert via API
-    response = requests.post(f"{BASE_URL}/insert", json={
-        "type": "text",
-        "vectors": vectors.tolist(),
-        "chunks": chunks,
+    # Ingest via API
+    response = requests.post(f"{BASE_URL}/ingest", json={
+        "docs_path": temp_dir,
+        "chunk_size": 100,
+        "overlap": 20,
         "namespace": "test"
     })
     
-    print_response("Insert Response", response)
+    print_response("Ingest Response", response)
+    
+    # Cleanup
+    import shutil
+    shutil.rmtree(temp_dir)
+    
     return response.status_code == 200
 
 
@@ -151,77 +155,45 @@ def test_stats():
     return response.status_code == 200
 
 
-def test_compact():
-    """Test compaction."""
+def test_restore():
+    """Test restoring soft-deleted vectors."""
     print("\n" + "="*60)
-    print("TEST 6: Compact Index")
+    print("TEST 6: Restore Soft-Deleted Vectors")
     print("="*60)
     
-    response = requests.post(f"{BASE_URL}/compact", json={
+    response = requests.post(f"{BASE_URL}/restore", json={
+        "doc_id": "doc1.txt",
         "namespace": "test"
     })
     
-    print_response("Compact Response", response)
+    print_response("Restore Response", response)
     return response.status_code == 200
 
 
-def test_snapshot():
-    """Test snapshot creation."""
+def test_hard_delete():
+    """Test hard delete."""
     print("\n" + "="*60)
-    print("TEST 7: Create Snapshot")
+    print("TEST 7: Hard Delete (Permanent)")
     print("="*60)
     
-    snapshot_name = f"demo_{int(time.time())}"
-    response = requests.post(f"{BASE_URL}/snapshot", json={
-        "name": snapshot_name
+    response = requests.post(f"{BASE_URL}/delete", json={
+        "doc_id": "doc2.txt",
+        "namespace": "test",
+        "hard_delete": True
     })
     
-    print_response("Snapshot Response", response)
-    
-    if response.status_code == 200:
-        data = response.json()
-        return data.get("snapshot_path")
-    return None
-
-
-def test_list_snapshots():
-    """List snapshots."""
-    print("\n" + "="*60)
-    print("TEST 8: List Snapshots")
-    print("="*60)
-    
-    response = requests.get(f"{BASE_URL}/snapshots")
-    print_response("List Snapshots Response", response)
+    print_response("Hard Delete Response", response)
     return response.status_code == 200
 
 
-def test_load_snapshot(snapshot_name):
-    """Test loading a snapshot."""
+def test_reset():
+    """Test reset (clear all data)."""
     print("\n" + "="*60)
-    print("TEST 9: Load Snapshot")
+    print("TEST 8: Reset (Clear All Data)")
     print("="*60)
     
-    # Extract name from path
-    if snapshot_name:
-        name = snapshot_name.split("snapshot_")[-1] if "snapshot_" in snapshot_name else snapshot_name
-    else:
-        # Get latest snapshot
-        response = requests.get(f"{BASE_URL}/snapshots")
-        if response.status_code == 200:
-            snapshots = response.json().get("snapshots", [])
-            if snapshots:
-                name = snapshots[0]["name"]
-            else:
-                print("No snapshots available")
-                return False
-        else:
-            return False
-    
-    response = requests.post(f"{BASE_URL}/load_snapshot", json={
-        "name": name
-    })
-    
-    print_response("Load Snapshot Response", response)
+    response = requests.post(f"{BASE_URL}/reset")
+    print_response("Reset Response", response)
     return response.status_code == 200
 
 
@@ -248,33 +220,29 @@ def main():
     results = []
     
     # Run tests
-    results.append(("Insert", test_insert()))
-    time.sleep(1)
+    results.append(("Ingest", test_ingest()))
+    time.sleep(2)
     
     results.append(("Search", test_search()))
     time.sleep(1)
     
-    results.append(("Delete", test_delete()))
+    results.append(("Delete (Soft)", test_delete()))
     time.sleep(1)
     
     results.append(("Search After Delete", test_search_after_delete()))
     time.sleep(1)
     
+    results.append(("Restore", test_restore()))
+    time.sleep(1)
+    
+    results.append(("Hard Delete", test_hard_delete()))
+    time.sleep(1)
+    
     results.append(("Stats", test_stats()))
     time.sleep(1)
     
-    results.append(("Compact", test_compact()))
-    time.sleep(1)
-    
-    snapshot_path = test_snapshot()
-    results.append(("Snapshot", snapshot_path is not None))
-    time.sleep(1)
-    
-    results.append(("List Snapshots", test_list_snapshots()))
-    time.sleep(1)
-    
-    # Test loading snapshot (optional, might restore deleted data)
-    # results.append(("Load Snapshot", test_load_snapshot(snapshot_path)))
+    # Reset is last (clears all data)
+    results.append(("Reset", test_reset()))
     
     # Summary
     print("\n" + "="*60)

@@ -1,12 +1,13 @@
+from __future__ import annotations
+
 """
 PRODUCTION FAISS Semantic Search API
 ====================================
 Production-ready Flask API with:
 - Stable vector IDs (IndexIDMap2)
 - SQLite metadata store
-- Deletion support
-- Compaction
-- Snapshots
+- Deletion support (soft/hard)
+- IVF-PQ indexing with smart retraining
 - Namespace isolation
 """
 
@@ -14,6 +15,8 @@ import os
 import sys
 import warnings
 import numpy as np
+from typing import List, Dict, Optional, Tuple
+from pathlib import Path
 
 # Disable multiprocessing parallelism
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -44,14 +47,12 @@ from src.embed import Embedder
 from src.transform import transform_to_chunks
 from src.load import load_documents
 
-# Import pipeline components
+# Import PDF processing components
 try:
-    from src.pipeline import run_pipeline
-    from src.pdf_process import process_pdf, store_pdf_data
+    from src.pdf_process import extract_text_from_pdf, convert_pdf_pages_to_images
 except ImportError:
-    run_pipeline = None
-    process_pdf = None
-    store_pdf_data = None
+    extract_text_from_pdf = None
+    convert_pdf_pages_to_images = None
 
 # Import store_v2 from local faiss-research/src/
 # Add current directory to path for local imports
@@ -67,6 +68,13 @@ store_v2_module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(store_v2_module)
 VectorStoreV2 = store_v2_module.VectorStoreV2
 
+# Import config
+config_path = os.path.join(current_dir, "src", "config.py")
+config_spec = importlib.util.spec_from_file_location("config", config_path)
+config_module = importlib.util.module_from_spec(config_spec)
+config_spec.loader.exec_module(config_module)
+get_config = config_module.get_config
+
 import json
 
 # Lazy imports
@@ -78,6 +86,9 @@ except ImportError:
 app = Flask(__name__)
 # Base directory is parent of faiss-research (main project root)
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# Load configuration
+config = get_config()
 
 # Global instances
 embedder = None
@@ -106,9 +117,196 @@ def get_image_embedder():
 def get_store():
     global store
     if store is None:
-        store = VectorStoreV2(data_dir=os.path.join(BASE_DIR, "data"))
+        # Use shard-specific data directory from config
+        data_dir = config.get_data_dir()
+        store = VectorStoreV2(data_dir=data_dir)
         store.load()
     return store
+
+
+def _describe_images_with_ollama(images: List[Dict], chunk_size: int, overlap: int, embedder) -> Tuple[Optional[List[Dict]], Optional[np.ndarray]]:
+    """
+    Generate image descriptions using Ollama and create text embeddings.
+    
+    Returns:
+        Tuple of (image_description_chunks, image_description_vectors) or (None, None) if failed
+    """
+    try:
+        import ollama
+    except ImportError:
+        print("  ⚠ Warning: ollama not installed. Run: pip install ollama")
+        print("  Images will only have CLIP embeddings (no text descriptions)")
+        return None, None
+    
+    try:
+        models = ollama.list()
+        print(f"  ✓ Ollama is available")
+        
+        vision_model = os.environ.get("OLLAMA_VISION_MODEL", "gemma3:4b")
+        print(f"  Using vision model: {vision_model}")
+        
+        def describe_image_with_ollama(image_path: str, model: str = None) -> str:
+            """Use Ollama to describe an image in detail."""
+            if model is None:
+                model = os.environ.get("OLLAMA_VISION_MODEL", "gemma3:4b")
+            try:
+                response = ollama.chat(
+                    model=model,
+                    messages=[{
+                        "role": "user",
+                        "content": "Describe this image in detail, including all text, objects, layout, colors, and any other relevant information. Be thorough and specific.",
+                        "images": [image_path]
+                    }]
+                )
+                return response["message"]["content"]
+            except Exception as e:
+                print(f"  ⚠ Warning: Failed to describe image {image_path}: {e}")
+                return f"Image description unavailable: {str(e)}"
+        
+        # Describe each image
+        image_descriptions = []
+        for idx, img_data in enumerate(images):
+            try:
+                image_path = img_data.get("image_path")
+                if not image_path:
+                    import tempfile
+                    from PIL import Image
+                    temp_file = tempfile.NamedTemporaryFile(suffix='.png', delete=False)
+                    img_data["image"].save(temp_file.name)
+                    image_path = temp_file.name
+                    img_data["image_path"] = image_path
+                
+                print(f"    Describing image {idx + 1}/{len(images)}: {img_data['source_file']}...")
+                description = describe_image_with_ollama(image_path, model=vision_model)
+                image_descriptions.append({
+                    "source_file": img_data["source_file"],
+                    "image_path": img_data.get("image_path"),
+                    "description": description
+                })
+                print(f"    ✓ Described {img_data['source_file']} ({len(description)} characters)")
+            except Exception as e:
+                print(f"    ✗ ERROR: Failed to describe {img_data['source_file']}: {e}")
+                continue
+        
+        if not image_descriptions:
+            return None, None
+        
+        # Chunk the descriptions
+        print("  Chunking image descriptions...")
+        description_documents = []
+        for desc_data in image_descriptions:
+            description_documents.append({
+                "filename": f"{desc_data['source_file']}_description",
+                "filepath": desc_data.get("image_path", ""),
+                "content": desc_data["description"]
+            })
+        
+        image_description_chunks = transform_to_chunks(description_documents, chunk_size=chunk_size, overlap=overlap)
+        
+        # Add metadata to identify as image descriptions
+        for chunk in image_description_chunks:
+            chunk["type"] = "image_description"
+            chunk["is_image_description"] = True
+            for desc_data in image_descriptions:
+                if desc_data["source_file"] in chunk.get("chunk_id", ""):
+                    chunk["image_path"] = desc_data.get("image_path")
+                    chunk["original_image_file"] = desc_data["source_file"]
+                    break
+        
+        print(f"  ✓ Created {len(image_description_chunks)} description chunks")
+        
+        # Embed description chunks
+        print("  Embedding image descriptions...")
+        desc_chunk_texts = [chunk["chunk_text"] for chunk in image_description_chunks]
+        image_description_vectors = embedder.embed(desc_chunk_texts, batch_size=128)
+        print(f"  ✓ Generated {len(image_description_vectors)} description embeddings")
+        
+        return image_description_chunks, image_description_vectors
+        
+    except Exception as e:
+        print(f"  ⚠ Warning: Could not connect to Ollama: {e}")
+        print(f"  Make sure Ollama is running: ollama serve")
+        print(f"  And pull a vision model: ollama pull gemma3:4b")
+        return None, None
+
+
+def _process_pdf_file(pdf_path: Path, embedder, image_embedder, chunk_size: int, overlap: int, 
+                     namespace: str, store) -> Dict:
+    """
+    Process a single PDF file: extract text and convert pages to images.
+    
+    Returns:
+        Dictionary with processing statistics
+    """
+    pdf_stats = {}
+    pdf_filename = os.path.basename(str(pdf_path))
+    
+    try:
+        print(f"\nProcessing PDF: {pdf_filename}")
+        
+        # Extract text from PDF
+        if extract_text_from_pdf:
+            print("  Step 1: Extracting text from PDF...")
+            try:
+                text_content = extract_text_from_pdf(str(pdf_path))
+                if text_content:
+                    document = {
+                        "filename": pdf_filename,
+                        "filepath": str(pdf_path),
+                        "content": text_content
+                    }
+                    text_chunks_pdf = transform_to_chunks([document], chunk_size=chunk_size, overlap=overlap)
+                    if text_chunks_pdf:
+                        chunk_texts = [chunk["chunk_text"] for chunk in text_chunks_pdf]
+                        text_vectors_pdf = embedder.embed(chunk_texts, batch_size=128)
+                        store.store_text(text_vectors_pdf, text_chunks_pdf, namespace=namespace, skip_training_check=True)
+                        pdf_stats["pdf_text_vectors_stored"] = len(text_vectors_pdf)
+                        print(f"  ✓ Stored {len(text_vectors_pdf)} text embeddings from PDF")
+            except Exception as e:
+                print(f"  ⚠ Warning: Could not extract text from PDF: {e}")
+        
+        # Convert PDF pages to images and embed with CLIP
+        if convert_pdf_pages_to_images and image_embedder:
+            print("  Step 2: Converting PDF pages to images...")
+            try:
+                pages = convert_pdf_pages_to_images([str(pdf_path)], dpi=200)
+                if pages:
+                    from PIL import Image
+                    pil_images_pdf = []
+                    for page_data in pages:
+                        if page_data.get("image_path") and os.path.exists(page_data["image_path"]):
+                            pil_images_pdf.append(Image.open(page_data["image_path"]))
+                    
+                    if pil_images_pdf:
+                        print(f"  Generating CLIP embeddings for {len(pil_images_pdf)} PDF pages...")
+                        image_vectors_pdf = image_embedder.embed_images(pil_images_pdf)
+                        
+                        image_data_list = []
+                        for idx, page_data in enumerate(pages):
+                            if idx < len(image_vectors_pdf):
+                                image_data_list.append({
+                                    "source_file": page_data.get("source_file", pdf_filename),
+                                    "image_index": page_data.get("page_num", 0),
+                                    "image_path": page_data.get("image_path")
+                                })
+                        
+                        if image_data_list:
+                            store.store_images(image_vectors_pdf, image_data_list, namespace=namespace, skip_training_check=True)
+                            pdf_stats["pdf_image_vectors_stored"] = len(image_vectors_pdf)
+                            print(f"  ✓ Stored {len(image_vectors_pdf)} image embeddings from PDF pages")
+                        
+                        pdf_stats["pdf_pages_processed"] = len(pages)
+            except Exception as e:
+                print(f"  ⚠ Warning: Could not process PDF pages as images: {e}")
+        
+        pdf_stats["pdf_files_processed"] = 1
+        return pdf_stats
+        
+    except Exception as e:
+        print(f"Error processing PDF {pdf_path}: {e}")
+        import traceback
+        traceback.print_exc()
+        return {"error": str(e)}
 
 
 # ============================================================================
@@ -131,11 +329,13 @@ def root():
         "endpoints": {
             "GET /": "API information",
             "GET /health": "Health check",
+            "GET /whoami": "Get shard information",
             "POST /ingest": "Ingest documents from folder (full pipeline)",
             "POST /search": "Search vectors",
             "POST /delete": "Delete by doc_id or chunk_id (soft delete by default, use hard_delete=true for permanent)",
             "POST /restore": "Restore soft-deleted vectors (undo soft delete)",
             "GET /stats": "Get statistics",
+            "GET /vectors": "Get all vectors (with optional namespace, limit, offset)",
             "POST /reset": "Reset - Clear all data and start fresh"
         }
     }), 200
@@ -145,6 +345,28 @@ def root():
 def health():
     """Health check."""
     return jsonify({"ok": True}), 200
+
+
+@app.route('/whoami', methods=['GET'])
+def whoami():
+    """Get shard information."""
+    try:
+        store = get_store()
+        stats = store.get_stats()
+        
+        # Count namespaces
+        namespaces_count = len(stats.get("namespaces", {}))
+        
+        return jsonify({
+            "shard_id": config.shard_id,
+            "shard_count": config.shard_count,
+            "is_shard_mode": config.is_shard_mode(),
+            "data_dir": str(config.shard_data_dir),
+            "port": config.port,
+            "namespaces_count": namespaces_count
+        }), 200
+    except Exception as e:
+        return jsonify({"error": f"Error: {str(e)}"}), 500
 
 
 @app.route('/ingest', methods=['POST'])
@@ -225,108 +447,9 @@ def ingest():
         image_description_chunks = None
         image_description_vectors = None
         if images and extract_images:
-            try:
-                import ollama
-                OLLAMA_AVAILABLE = True
-            except ImportError:
-                ollama = None
-                OLLAMA_AVAILABLE = False
-                print("  ⚠ Warning: ollama not installed. Run: pip install ollama")
-                print("  Images will only have CLIP embeddings (no text descriptions)")
-            
-            if OLLAMA_AVAILABLE:
-                try:
-                    # Check if Ollama is running
-                    models = ollama.list()
-                    print(f"  ✓ Ollama is available")
-                    
-                    # Get vision model (default to gemma3:4b)
-                    vision_model = os.environ.get("OLLAMA_VISION_MODEL", "gemma3:4b")
-                    print(f"  Using vision model: {vision_model}")
-                    
-                    # Define describe_image_with_ollama function inline
-                    def describe_image_with_ollama(image_path: str, model: str = None) -> str:
-                        """Use Ollama to describe an image in detail."""
-                        if model is None:
-                            model = os.environ.get("OLLAMA_VISION_MODEL", "gemma3:4b")
-                        try:
-                            response = ollama.chat(
-                                model=model,
-                                messages=[{
-                                    "role": "user",
-                                    "content": "Describe this image in detail, including all text, objects, layout, colors, and any other relevant information. Be thorough and specific.",
-                                    "images": [image_path]
-                                }]
-                            )
-                            return response["message"]["content"]
-                        except Exception as e:
-                            print(f"  ⚠ Warning: Failed to describe image {image_path}: {e}")
-                            return f"Image description unavailable: {str(e)}"
-                    
-                    # Describe each image
-                    image_descriptions = []
-                    for idx, img_data in enumerate(images):
-                        try:
-                            image_path = img_data.get("image_path")
-                            if not image_path:
-                                # Save image temporarily if no path
-                                import tempfile
-                                from PIL import Image
-                                temp_file = tempfile.NamedTemporaryFile(suffix='.png', delete=False)
-                                img_data["image"].save(temp_file.name)
-                                image_path = temp_file.name
-                                img_data["image_path"] = image_path
-                            
-                            print(f"    Describing image {idx + 1}/{len(images)}: {img_data['source_file']}...")
-                            description = describe_image_with_ollama(image_path, model=vision_model)
-                            image_descriptions.append({
-                                "source_file": img_data["source_file"],
-                                "image_path": img_data.get("image_path"),
-                                "description": description
-                            })
-                            print(f"    ✓ Described {img_data['source_file']} ({len(description)} characters)")
-                        except Exception as e:
-                            print(f"    ✗ ERROR: Failed to describe {img_data['source_file']}: {e}")
-                            continue
-                    
-                    if image_descriptions:
-                        # Chunk the descriptions
-                        print("  Chunking image descriptions...")
-                        description_documents = []
-                        for desc_data in image_descriptions:
-                            description_documents.append({
-                                "filename": f"{desc_data['source_file']}_description",
-                                "filepath": desc_data.get("image_path", ""),
-                                "content": desc_data["description"]
-                            })
-                        
-                        image_description_chunks = transform_to_chunks(description_documents, chunk_size=chunk_size, overlap=overlap)
-                        
-                        # Add metadata to identify as image descriptions and link back to images
-                        for idx, chunk in enumerate(image_description_chunks):
-                            chunk["type"] = "image_description"
-                            chunk["is_image_description"] = True
-                            # Find which image this chunk belongs to
-                            for desc_data in image_descriptions:
-                                if desc_data["source_file"] in chunk.get("chunk_id", ""):
-                                    chunk["image_path"] = desc_data.get("image_path")
-                                    chunk["original_image_file"] = desc_data["source_file"]
-                                    break
-                        
-                        print(f"  ✓ Created {len(image_description_chunks)} description chunks")
-                        
-                        # Embed description chunks
-                        if image_description_chunks:
-                            print("  Embedding image descriptions...")
-                            desc_chunk_texts = [chunk["chunk_text"] for chunk in image_description_chunks]
-                            image_description_vectors = embedder.embed(desc_chunk_texts, batch_size=128)
-                            print(f"  ✓ Generated {len(image_description_vectors)} description embeddings")
-                
-                except Exception as e:
-                    print(f"  ⚠ Warning: Could not connect to Ollama: {e}")
-                    print(f"  Make sure Ollama is running: ollama serve")
-                    print(f"  And pull a vision model: ollama pull gemma3:4b")
-                    OLLAMA_AVAILABLE = False
+            image_description_chunks, image_description_vectors = _describe_images_with_ollama(
+                images, chunk_size, overlap, embedder
+            )
         
         # Store in production VectorStoreV2
         store = get_store()
@@ -346,83 +469,17 @@ def ingest():
         
         # Process PDFs - ALWAYS do BOTH text and image embeddings
         pdf_stats = {}
-        if process_pdf is not None:
-            from pathlib import Path
+        if extract_text_from_pdf or convert_pdf_pages_to_images:
             docs_path_obj = Path(docs_path)
             pdf_files = list(docs_path_obj.glob("*.pdf")) + list(docs_path_obj.glob("*.PDF"))
             
             for pdf_path in pdf_files:
-                try:
-                    pdf_filename = os.path.basename(str(pdf_path))
-                    print(f"\nProcessing PDF: {pdf_filename}")
-                    
-                    # STEP 1: Extract text from PDF
-                    print("  Step 1: Extracting text from PDF...")
-                    try:
-                        from src.pdf_process import extract_text_from_pdf
-                        text_content = extract_text_from_pdf(str(pdf_path))
-                        
-                        if text_content:
-                            document = {
-                                "filename": pdf_filename,
-                                "filepath": str(pdf_path),
-                                "content": text_content
-                            }
-                            text_chunks_pdf = transform_to_chunks([document], chunk_size=chunk_size, overlap=overlap)
-                            if text_chunks_pdf:
-                                chunk_texts = [chunk["chunk_text"] for chunk in text_chunks_pdf]
-                                text_vectors_pdf = embedder.embed(chunk_texts, batch_size=128)
-                                # Store text embeddings (skip training check - will train at end)
-                                store.store_text(text_vectors_pdf, text_chunks_pdf, namespace=namespace, skip_training_check=True)
-                                pdf_stats["pdf_text_vectors_stored"] = pdf_stats.get("pdf_text_vectors_stored", 0) + len(text_vectors_pdf)
-                                print(f"  ✓ Stored {len(text_vectors_pdf)} text embeddings from PDF")
-                    except Exception as e:
-                        print(f"  ⚠ Warning: Could not extract text from PDF: {e}")
-                    
-                    # STEP 2: Convert PDF pages to images and embed with CLIP
-                    print("  Step 2: Converting PDF pages to images...")
-                    try:
-                        from src.pdf_process import convert_pdf_pages_to_images
-                        pages = convert_pdf_pages_to_images([str(pdf_path)], dpi=200)
-                        
-                        if pages and image_embedder:
-                            from PIL import Image
-                            pil_images_pdf = []
-                            for page_data in pages:
-                                if page_data.get("image_path") and os.path.exists(page_data["image_path"]):
-                                    pil_images_pdf.append(Image.open(page_data["image_path"]))
-                            
-                            if pil_images_pdf:
-                                print(f"  Generating CLIP embeddings for {len(pil_images_pdf)} PDF pages...")
-                                image_vectors_pdf = image_embedder.embed_images(pil_images_pdf)
-                                
-                                # Convert pages to image format for store_images
-                                image_data_list = []
-                                for idx, page_data in enumerate(pages):
-                                    if idx < len(image_vectors_pdf):
-                                        image_data_list.append({
-                                            "source_file": page_data.get("source_file", pdf_filename),
-                                            "image_index": page_data.get("page_num", 0),
-                                            "image_path": page_data.get("image_path")
-                                        })
-                                
-                                # Store image embeddings (CLIP) (skip training check - will train at end)
-                                if image_data_list:
-                                    store.store_images(image_vectors_pdf, image_data_list, namespace=namespace, skip_training_check=True)
-                                    pdf_stats["pdf_image_vectors_stored"] = pdf_stats.get("pdf_image_vectors_stored", 0) + len(image_vectors_pdf)
-                                    print(f"  ✓ Stored {len(image_vectors_pdf)} image embeddings from PDF pages")
-                        else:
-                            print(f"  ⚠ Warning: Could not convert PDF pages to images or image embedder not available")
-                    except Exception as e:
-                        print(f"  ⚠ Warning: Could not process PDF pages as images: {e}")
-                    
-                    pdf_stats["pdf_pages_processed"] = pdf_stats.get("pdf_pages_processed", 0) + len(pages) if 'pages' in locals() else 0
-                    pdf_stats["pdf_files_processed"] = pdf_stats.get("pdf_files_processed", 0) + 1
-                except Exception as e:
-                    print(f"Error processing PDF {pdf_path}: {e}")
-                    import traceback
-                    traceback.print_exc()
-                    continue
+                file_stats = _process_pdf_file(pdf_path, embedder, image_embedder, chunk_size, overlap, namespace, store)
+                # Aggregate stats
+                for key, value in file_stats.items():
+                    if key == "error":
+                        continue
+                    pdf_stats[key] = pdf_stats.get(key, 0) + value
         
         # PHASE 2: Finalize ingestion - check 20% rule ONCE and train if needed
         print("\n" + "="*60)
@@ -723,6 +780,36 @@ def restore():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route('/vectors', methods=['GET'])
+def get_vectors():
+    """
+    Get all vectors from the database.
+    
+    Query parameters:
+    - namespace: Optional namespace filter
+    - limit: Optional limit (default: 1000)
+    - offset: Optional offset for pagination (default: 0)
+    """
+    try:
+        namespace = request.args.get('namespace')
+        limit = request.args.get('limit', type=int)
+        offset = request.args.get('offset', type=int, default=0)
+        
+        store = get_store()
+        vectors = store.get_all_vectors(namespace=namespace, limit=limit, offset=offset)
+        
+        return jsonify({
+            "vectors": vectors,
+            "count": len(vectors),
+            "namespace": namespace,
+            "limit": limit,
+            "offset": offset
+        }), 200
+    
+    except Exception as e:
+        return jsonify({"error": f"Error: {str(e)}"}), 500
+
+
 @app.route('/reset', methods=['POST'])
 def reset():
     """
@@ -794,6 +881,10 @@ if __name__ == '__main__':
     print("  GET  /stats      - Get statistics")
     print("  POST /reset      - Reset (clear all data)")
     print("="*60)
-    print("\nServer starting on http://localhost:5001\n")
+    port = config.port
+    shard_info = ""
+    if config.is_shard_mode():
+        shard_info = f" (Shard {config.shard_id}/{config.shard_count})"
+    print(f"\nServer starting on http://localhost:{port}{shard_info}\n")
     
-    app.run(host='0.0.0.0', port=5001, debug=True)
+    app.run(host='0.0.0.0', port=port, debug=True)
